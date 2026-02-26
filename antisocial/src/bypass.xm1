@@ -1,0 +1,755 @@
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <string>
+#import <vector>
+#import <dlfcn.h>
+#import <fcntl.h>
+#import <sys/stat.h>
+#import <unistd.h>
+#import <stdlib.h>
+#import <Foundation/Foundation.h>
+#import <string>
+#import <array>
+#import <dlfcn.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <mach-o/dyld.h>
+#import <stdlib.h>
+#import <mach/task_info.h>
+#import <substrate.h>
+#import <mach-o/dyld_images.h>
+#import <objc/runtime.h>
+#import <stdio.h>
+#import <stdarg.h>
+#import <stdbool.h>
+#import <sys/utsname.h>
+#import <dirent.h>
+
+#import "fishhook/fishhook.h"
+
+#import "globals.hpp"
+
+static void (*orig_exit)(int) = NULL;
+static void (*orig_abort)(void) = NULL;
+
+void hk_exit(int status) {
+    //NSLog(@"[HOOK] exit(%d) called — игнорим!", status);
+}
+
+void hk_abort(void) {
+    //NSLog(@"[HOOK] abort() called — игнорим!");
+}
+
+void log_async(const std::string& text) {
+    /*
+    char* copy = strdup(text.c_str());
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        FILE* f = fopen("/var/mobile/Containers/Data/Application/3FF5D4FE-5538-4D43-99E0-D6AC7EAF2AA1/Documents/dlsym.txt", "a+");
+        if(f) {
+            fputs(copy, f);
+            fputc('\n', f);
+            fclose(f);
+        }
+        free(copy);
+    });
+    */
+}
+
+std::vector<std::string> dyld_hidden = {
+    crypt_string("libsubstrate.dylib"),
+    crypt_string("substrate"),
+    crypt_string("systemhook.dylib"),
+    crypt_string("SubstrateLoader.dylib"),
+    crypt_string("SSLKillSwitch2.dylib"),
+    crypt_string("SSLKillSwitch.dylib"),
+    crypt_string("MobileSubstrate.dylib"),
+    crypt_string("TweakInject.dylib"),
+    crypt_string("CydiaSubstrate"),
+    crypt_string("cynject"),
+    crypt_string("CustomWidgetIcons"),
+    crypt_string("PreferenceLoader"),
+    crypt_string("RocketBootstrap"),
+    crypt_string("WeeLoader"),
+    crypt_string("/.file"),
+    crypt_string("libhooker"),
+    crypt_string("SubstrateInserter"),
+    crypt_string("SubstrateBootstrap"),
+    crypt_string("ABypass"),
+    crypt_string("FlyJB"),
+    crypt_string("Substitute"),
+    crypt_string("Cephei"),
+    crypt_string("Electra"),
+    crypt_string("AppSyncUnified-FrontBoard.dylib"),
+    crypt_string("Shadow"),
+    crypt_string("FridaGadget"),
+    crypt_string("frida"),
+    crypt_string("libcycript"),
+    crypt_string("jbroot"),
+    crypt_string("TweakInject"),
+    crypt_string("dopamine"),
+    crypt_string("antisocial.dylib"),
+    crypt_string("antisocial"),
+    crypt_string("systemhook")
+};
+
+bool is_dyld_hidden(const std::string& name)
+{
+    for (const auto& path : dyld_hidden)
+    {
+        if (name.find(path) != std::string::npos)
+            return true;
+    }
+
+    return false;
+}
+
+struct dyld_idx_t {
+    int idx;
+    std::unique_ptr<char[]> name;
+    const mach_header* header;
+    intptr_t slide;
+};
+
+std::vector<dyld_idx_t> dyld_summary;
+
+void aggregate_dyld() {
+    dyld_summary.clear();
+    int count = _dyld_image_count();
+
+    for (int i = 0; i < count; i++) {
+        const char* name = _dyld_get_image_name(i);
+        if (!name) continue;
+
+        std::string s(name);
+        if (is_dyld_hidden(s)) {
+            continue;
+        }
+
+        char* stable = strdup(name);
+        dyld_summary.push_back({ i, std::unique_ptr<char[]>(stable), _dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i) });
+    }
+}
+
+%group dyld_hooks
+
+%hookf(uint32_t, _dyld_image_count)
+{
+    return static_cast<uint32_t>(dyld_summary.size());   
+}
+
+%hookf(const char*, _dyld_get_image_name, uint32_t index) 
+{
+    if (index >= dyld_summary.size()) {
+        return nullptr;
+    }
+
+    return dyld_summary[index].name.get();
+}
+
+%hookf(const struct mach_header*, _dyld_get_image_header, uint32_t index) 
+{
+    if (index < 0 || index >= static_cast<int>(dyld_summary.size()))
+        return nullptr;
+    return dyld_summary[index].header;
+}
+
+%hookf(intptr_t, _dyld_get_image_vmaddr_slide, uint32_t index)
+{
+    if (index < 0 || index >= static_cast<int>(dyld_summary.size()))
+        return 0;
+    return dyld_summary[index].slide;
+}
+
+%end
+
+std::array<std::string, 6> hidden =
+{
+    crypt_string("antisocial"),
+    crypt_string("antisocial.dylib"),
+    crypt_string("libsubstrate.dylib"),
+    crypt_string("substrate"),
+    crypt_string("jbroot"),
+    crypt_string("TweakInject")
+};
+
+bool is_lib_hidden(const std::string& lib)
+{
+    return std::find(hidden.begin(), hidden.end(), lib) != hidden.end();
+}
+
+kern_return_t (*og_task_info)(task_name_t target_task, task_flavor_t flavor, task_info_t task_info_out, mach_msg_type_number_t* task_info_outCnt);
+kern_return_t hk_task_info(task_name_t target_task, task_flavor_t flavor, task_info_t task_info_out, mach_msg_type_number_t* task_info_outCnt) {
+    if (flavor == TASK_DYLD_INFO)
+    {
+        kern_return_t kret = og_task_info(target_task, flavor, task_info_out, task_info_outCnt);
+
+        if(kret == KERN_SUCCESS)
+        {
+            struct task_dyld_info* task_inf = (struct task_dyld_info*)task_info_out;
+            struct dyld_all_image_infos* dyld_info = (struct dyld_all_image_infos*)task_inf->all_image_info_addr;
+            size_t dyld_info_count = dyld_info->infoArrayCount;
+            struct dyld_image_info* new_info_array = (struct dyld_image_info*)malloc(sizeof(struct dyld_image_info) * dyld_info_count);
+            size_t new_info_count = 0;
+
+            for(int i = 0; i < dyld_info_count; i++)
+            {
+                auto info = dyld_info->infoArray[i];
+                if(is_lib_hidden(info.imageFilePath)) {
+                    continue;
+                }
+
+                new_info_array[new_info_count++] = info;
+            }
+            
+            dyld_info->infoArray = new_info_array;
+            dyld_info->infoArrayCount = (uint32_t)new_info_count;
+        }
+        return kret;
+    }
+
+    return og_task_info(target_task, flavor, task_info_out, task_info_outCnt);
+}
+
+%hookf(kern_return_t, task_info, task_name_t target_task, task_flavor_t flavor, task_info_t task_info_out, mach_msg_type_number_t* task_info_outCnt)
+{
+    if(flavor == TASK_DYLD_INFO)
+    {
+        kern_return_t kret = %orig(target_task, flavor, task_info_out, task_info_outCnt);
+
+        if(kret == KERN_SUCCESS)
+        {
+            struct task_dyld_info* task_inf = (struct task_dyld_info*)task_info_out;
+            struct dyld_all_image_infos* dyld_info = (struct dyld_all_image_infos*)task_inf->all_image_info_addr;
+            size_t dyld_info_count = dyld_info->infoArrayCount;
+            struct dyld_image_info* new_info_array = (struct dyld_image_info*)malloc(sizeof(struct dyld_image_info) * dyld_info_count);
+            size_t new_info_count = 0;
+
+            for(int i = 0; i < dyld_info_count; i++)
+            {
+                auto info = dyld_info->infoArray[i];
+                if(is_lib_hidden(info.imageFilePath)) {
+                    continue;
+                }
+
+                new_info_array[new_info_count++] = info;
+            }
+            
+            dyld_info->infoArray = new_info_array;
+            dyld_info->infoArrayCount = (uint32_t)new_info_count;
+        }
+        return kret;
+    }
+
+    return %orig(target_task, flavor, task_info_out, task_info_outCnt);
+}
+
+%hook NSURLSession
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                          completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler
+{
+    id url = ((id(*)(id, SEL))objc_msgSend)(request, sel_registerName(ay_obfuscate("URL")));
+    id urlString = ((id(*)(id, SEL))objc_msgSend)(url, sel_registerName(ay_obfuscate("absoluteString")));
+
+    SEL containsSel = sel_registerName(ay_obfuscate("containsString:"));
+    id fantaStr = ns_encrypt("fanta");
+    id iosStr = ns_encrypt("ios");
+    id timeStr = ns_encrypt("time");
+    BOOL containsFanta = ((BOOL(*)(id, SEL, id))objc_msgSend)(urlString, containsSel, fantaStr)
+                         && (((BOOL(*)(id, SEL, id))objc_msgSend)(urlString, containsSel, iosStr));
+
+    if (containsFanta) {
+        void (^fakeCompletion)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (completionHandler) {
+                id contentTypeKey = ns_encrypt("Content-Type");
+                id contentTypeValue = ns_encrypt("text/plain");
+                id headerDict = [NSDictionary dictionaryWithObject:contentTypeValue forKey:contentTypeKey];
+
+                Class NSHTTPURLResponseClass = objc_getClass(ay_obfuscate("NSHTTPURLResponse"));
+                SEL allocSel = sel_registerName(ay_obfuscate("alloc"));
+                SEL initSel = sel_registerName(ay_obfuscate("initWithURL:statusCode:HTTPVersion:headerFields:"));
+                id fakeResponse = ((id(*)(id, SEL, id, NSInteger, id, id))objc_msgSend)(
+                    ((id(*)(id, SEL))objc_msgSend)(NSHTTPURLResponseClass, allocSel),
+                    initSel,
+                    request.URL,
+                    200,
+                    ns_encrypt("HTTP/1.1"),
+                    headerDict
+                );
+                completionHandler([ns_encrypt("DEEPSEEK 30$ ANTICHEAT PWNED BY @antisocial_pub! SOSI ZHIRNIY PIDORAS =) -> $$$ GANG <-") dataUsingEncoding:NSUTF8StringEncoding], fakeResponse, nil);
+            }
+        };
+
+        NSURLSessionDataTask *task = %orig(request, fakeCompletion);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            fakeCompletion(nil, nil, nil);
+        });
+        return task;
+    }
+
+    return %orig(request, completionHandler);
+}
+%end
+
+%hook NSURLConnection
++ (NSData *)sendSynchronousRequest:(NSURLRequest *)request
+                returningResponse:(NSURLResponse **)response
+                            error:(NSError **)error
+{
+    
+    id url = ((id(*)(id, SEL))objc_msgSend)(request, sel_registerName(ay_obfuscate("URL")));
+    id urlString = ((id(*)(id, SEL))objc_msgSend)(url, sel_registerName(ay_obfuscate("absoluteString")));
+
+    SEL containsSel = sel_registerName(ay_obfuscate("containsString:"));
+    id fantaStr = ns_encrypt("fanta");
+    id iosStr = ns_encrypt("ios");
+    id timeStr = ns_encrypt("time");
+    BOOL containsFanta = ((BOOL(*)(id, SEL, id))objc_msgSend)(urlString, containsSel, fantaStr)
+                         && (((BOOL(*)(id, SEL, id))objc_msgSend)(urlString, containsSel, iosStr));
+
+    if (containsFanta) {
+        if (response) {
+            id contentTypeKey = ns_encrypt("Content-Type");
+            id contentTypeValue = ns_encrypt("text/plain");
+            id headerDict = [NSDictionary dictionaryWithObject:contentTypeValue forKey:contentTypeKey];
+
+            Class NSHTTPURLResponseClass = objc_getClass(ay_obfuscate("NSHTTPURLResponse"));
+            SEL allocSel = sel_registerName(ay_obfuscate("alloc"));
+            SEL initSel = sel_registerName(ay_obfuscate("initWithURL:statusCode:HTTPVersion:headerFields:"));
+            id fakeResponse = ((id(*)(id, SEL, id, NSInteger, id, id))objc_msgSend)(
+                ((id(*)(id, SEL))objc_msgSend)(NSHTTPURLResponseClass, allocSel),
+                initSel,
+                request.URL,
+                200,
+                ns_encrypt("HTTP/1.1"),
+                headerDict
+            );
+            *response = fakeResponse;
+        }
+        if (error) *error = nil;
+
+        return [ns_encrypt("DEEPSEEK 30$ ANTICHEAT PWNED BY @antisocial_pub! SOSI ZHIRNIY PIDORAS =) -> $$$ GANG <-") dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
+    return %orig(request, response, error);
+}
+%end
+
+static inline bool is_hidden_path(const char * path) {
+    if (!path) return false;
+    std::string s(path);
+    for (auto &h: hidden) {
+        if (s.find(h) != std::string::npos && s.find(crypt_string(".png")) == std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool is_hidden_nsstring(NSString *str) {
+    if (!str) return false;
+
+    id lower = ((id(*)(id,SEL))objc_msgSend)(str, sel_registerName(ay_obfuscate("lowercaseString")));
+
+    for (auto &h : hidden) {
+        id h_ns = ((id(*)(Class,SEL,const char*))objc_msgSend)(
+            objc_getClass(ay_obfuscate("NSString")),
+            sel_registerName(ay_obfuscate("stringWithUTF8String:")),
+            h.c_str()
+        );
+
+        id pngStr = ((id(*)(Class,SEL,const char*))objc_msgSend)(
+            objc_getClass(ay_obfuscate("NSString")),
+            sel_registerName(ay_obfuscate("stringWithUTF8String:")),
+            ay_obfuscate(".png")
+        );
+
+        SEL selContains = sel_registerName(ay_obfuscate("containsString:"));
+        bool contains_h = ((bool(*)(id,SEL,id))objc_msgSend)(lower, selContains, h_ns);
+        bool contains_png = ((bool(*)(id,SEL,id))objc_msgSend)(lower, selContains, pngStr);
+
+        if (contains_h && !contains_png) {
+            return true;
+        }
+    }
+    return false;
+}
+
+%hook NSBundle
++ (NSArray<NSBundle *> *)allFrameworks {
+    id arr = %orig;
+    id mutableArr = ((id(*)(id,SEL))objc_msgSend)(arr, sel_registerName(ay_obfuscate("mutableCopy")));
+    id copyArr = ((id(*)(id,SEL))objc_msgSend)(mutableArr, sel_registerName(ay_obfuscate("copy")));
+
+    SEL selBundlePath = sel_registerName(ay_obfuscate("bundlePath"));
+    SEL selRemove = sel_registerName(ay_obfuscate("removeObject:"));
+    SEL selCount = sel_registerName(ay_obfuscate("count"));
+    SEL selObjectAtIndex = sel_registerName(ay_obfuscate("objectAtIndex:"));
+
+    NSInteger count = ((NSInteger(*)(id,SEL))objc_msgSend)(copyArr, selCount);
+    for(NSInteger i = count - 1; i >= 0; i--) {
+        id b = ((id(*)(id,SEL,NSInteger))objc_msgSend)(copyArr, selObjectAtIndex, i);
+        id path = ((id(*)(id,SEL))objc_msgSend)(b, selBundlePath);
+        if(is_hidden_nsstring(path)) {
+            ((void(*)(id,SEL,id))objc_msgSend)(mutableArr, selRemove, b);
+        }
+    }
+    return mutableArr;
+}
+
++ (NSArray<NSBundle *> *)allBundles {
+    id arr = %orig;
+    id mutableArr = ((id(*)(id,SEL))objc_msgSend)(arr, sel_registerName(ay_obfuscate("mutableCopy")));
+    id copyArr = ((id(*)(id,SEL))objc_msgSend)(mutableArr, sel_registerName(ay_obfuscate("copy")));
+
+    SEL selBundlePath = sel_registerName(ay_obfuscate("bundlePath"));
+    SEL selRemove = sel_registerName(ay_obfuscate("removeObject:"));
+    SEL selCount = sel_registerName(ay_obfuscate("count"));
+    SEL selObjectAtIndex = sel_registerName(ay_obfuscate("objectAtIndex:"));
+
+    NSInteger count = ((NSInteger(*)(id,SEL))objc_msgSend)(copyArr, selCount);
+    for(NSInteger i = count - 1; i >= 0; i--) {
+        id b = ((id(*)(id,SEL,NSInteger))objc_msgSend)(copyArr, selObjectAtIndex, i);
+        id path = ((id(*)(id,SEL))objc_msgSend)(b, selBundlePath);
+        if(is_hidden_nsstring(path)) {
+            ((void(*)(id,SEL,id))objc_msgSend)(mutableArr, selRemove, b);
+        }
+    }
+    return mutableArr;
+}
+%end
+
+%hook NSObject
++ (int)objc_getClassList:(Class *)buffer bufferCount:(int)count {
+    int ret = %orig(buffer,count);
+    int newCount = 0;
+
+    for(int i=0;i<ret;i++) {
+        const char* clsName = class_getName(buffer[i]);
+        if(!is_hidden_path(clsName)) {
+            buffer[newCount++] = buffer[i];
+        }
+    }
+    return newCount;
+}
+%end
+
+%hookf(int, stat, const char *path, struct stat *buf) {
+    if (is_hidden_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return %orig(path, buf);
+}
+
+%hookf(int, access, const char *path, int mode) {
+    if (is_hidden_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return %orig(path, mode);
+}
+
+%hookf(struct dirent *, readdir, DIR *dirp) {
+    struct dirent *ent;
+    while ((ent = %orig(dirp))) {
+        if (is_hidden_path(ent->d_name)) continue;
+        return ent;
+    }
+    return NULL;
+}
+
+%hookf(int, dladdr, const void *addr, Dl_info *info) {
+    int ret = %orig(addr, info);
+    if (ret != 0 && info && info->dli_fname && is_hidden_path(info->dli_fname)) {
+        info->dli_fname = "";
+    }
+    return ret;
+}
+
+%hookf(void*, dlopen, const char *path, int mode) {
+    if (is_hidden_path(path)) {
+        errno = ENOENT;
+        return NULL;
+    }
+    return %orig(path, mode);
+}
+
+%hook NSFileManager
+- (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
+    NSArray *orig = %orig(path,error);
+    if(!orig) return nil;
+
+    id filtered = ((id(*)(id,SEL))objc_msgSend)(orig, sel_registerName(ay_obfuscate("mutableCopy")));
+    SEL selCount = sel_registerName(ay_obfuscate("count"));
+    SEL selObjectAtIndex = sel_registerName(ay_obfuscate("objectAtIndex:"));
+    SEL selRemove = sel_registerName(ay_obfuscate("removeObject:"));
+
+    NSInteger count = ((NSInteger(*)(id,SEL))objc_msgSend)(orig, selCount);
+    for(NSInteger i = count - 1; i >= 0; i--) {
+        id f = ((id(*)(id,SEL,NSInteger))objc_msgSend)(orig, selObjectAtIndex, i);
+        if(is_hidden_nsstring(f)) {
+            ((void(*)(id,SEL,id))objc_msgSend)(filtered, selRemove, f);
+        }
+    }
+
+    return filtered;
+}
+%end
+
+%hook UIViewController
+- (void)presentViewController:(id)viewController animated:(BOOL)flag completion:(id)completion {
+    Class UIAlertCls = objc_getClass(ay_obfuscate("UIAlertController"));
+    if ([viewController isKindOfClass:UIAlertCls]) {
+        id title = ((id(*)(id,SEL))objc_msgSend)(viewController, sel_registerName(ay_obfuscate("title")));
+        id message = ((id(*)(id,SEL))objc_msgSend)(viewController, sel_registerName(ay_obfuscate("message")));
+
+        SEL selRange = sel_registerName(ay_obfuscate("rangeOfString:options:"));
+        bool hasError = false;
+        bool hasTechnical = false;
+
+        if(title) {
+            NSRange r = ((NSRange(*)(id,SEL,id,NSUInteger))objc_msgSend)(title, selRange, ns_encrypt("error"), 1 /*NSCaseInsensitiveSearch*/);
+            hasError = (r.location != NSNotFound);
+        }
+
+        if(message) {
+            NSRange r2 = ((NSRange(*)(id,SEL,id,NSUInteger))objc_msgSend)(message, selRange, ns_encrypt("technical"), 1);
+            hasTechnical = (r2.location != NSNotFound);
+        }
+
+        if(hasError && hasTechnical) {
+            return;
+        }
+    }
+
+    %orig(viewController, flag, completion);
+}
+%end
+
+%hook UIAlertController
+
++ (instancetype)alertControllerWithTitle:(NSString *)title
+                                 message:(NSString *)message
+                          preferredStyle:(UIAlertControllerStyle)preferredStyle {
+
+    UIAlertController *alert = %orig(title, message, preferredStyle);
+/*
+    SEL selRangeOfString = sel_registerName(ay_obfuscate("rangeOfString:options:"));
+
+    bool hasError = false;
+    bool hasTechnical = false;
+
+    if(title){
+        NSRange r = ((NSRange(*)(id,SEL,id,NSUInteger))objc_msgSend)(title, selRangeOfString, ns_encrypt("error"), 1);
+        hasError = (r.location != NSNotFound);
+    }
+    if(message){
+        NSRange r2 = ((NSRange(*)(id,SEL,id,NSUInteger))objc_msgSend)(message, selRangeOfString, ns_encrypt("technical"), 1);
+        hasTechnical = (r2.location != NSNotFound);
+    }
+
+    if(hasError && hasTechnical){
+        UIAlertController *custom = [UIAlertController alertControllerWithTitle:ns_encrypt("фанта пососи мой хуй")
+                                                                       message:ns_encrypt("owned by @antisocial_pub")
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+
+        UIAlertAction *ok = [UIAlertAction actionWithTitle:ns_encrypt("ТАК ТОЧНО") style:UIAlertActionStyleDefault handler:nil];
+        [custom addAction:ok];
+
+        return custom;
+    }
+*/
+    return alert;
+}
+
+%end
+
+static NSString *random_uuid() {
+    return [[NSUUID UUID] UUIDString];
+}
+
+uint32_t my__dyld_image_count(void) {
+    return static_cast<uint32_t>(dyld_summary.size());
+}
+
+const char* my__dyld_get_image_name(uint32_t index) {
+    if (index >= dyld_summary.size()) {
+        return nullptr;
+    }
+    
+    return dyld_summary[index].name.get();
+}
+
+const struct mach_header* my__dyld_get_image_header(uint32_t index) {
+    if (index < 0 || index >= static_cast<int>(dyld_summary.size()))
+        return nullptr;
+
+    return dyld_summary[index].header;
+}
+
+intptr_t my__dyld_get_image_vmaddr_slide(uint32_t index) {
+    if (index < 0 || index >= static_cast<int>(dyld_summary.size())) return 0;
+    return dyld_summary[index].slide;
+}
+
+static int (*orig_dladdr)(const void *addr, Dl_info *info);
+int hk_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr(addr, info);
+    if (ret && info && info->dli_fname && is_hidden_path(info->dli_fname)) {
+        info->dli_fname = ay_obfuscate("/usr/lib/libobjc.A.dylib");
+    }
+    return ret;
+}
+
+static void *(*og_dlsym)(void *handle, const char *symbol);
+static void *hk_dlsym(void *handle, const char *symbol) {
+    // log_async(symbol);
+    if (strcmp(symbol, ay_obfuscate("_dyld_image_count")) == 0) {
+        return (void*)&my__dyld_image_count;
+    }
+    if (strcmp(symbol, ay_obfuscate("_dyld_get_image_name")) == 0) {
+        return (void*)&my__dyld_get_image_name;
+    }
+    if (strcmp(symbol, ay_obfuscate("_dyld_get_image_header")) == 0) {
+        return (void*)&my__dyld_get_image_header;
+    }
+    if (strcmp(symbol, ay_obfuscate("_dyld_get_image_vmaddr_slide")) == 0) {
+        return (void*)&my__dyld_get_image_vmaddr_slide;
+    }
+    if (strcmp(symbol, ay_obfuscate("task_info")) == 0) {
+        return (void*)&hk_task_info;
+    }
+    if (strcmp(symbol, "dladdr") == 0) return (void*)&hk_dladdr;
+
+    return og_dlsym(handle, symbol);
+}
+
+// UIDevice.identifierForVendor
+%hook UIDevice
+- (NSString *)model {
+    return ns_encrypt("SM-J500H");
+}
+
+- (NSString *)systemName {
+    return ns_encrypt("Android");
+}
+
+- (NSString *)systemVersion {
+    return ns_encrypt("7.0");
+}
+
+- (NSString *)name {
+    return ns_encrypt("SAMSUNG");
+}
+
+- (NSString *)localizedModel {
+    return ns_encrypt("SAMSUNG");
+}
+
+- (NSUUID *)identifierForVendor {
+    static NSUUID *fake = nil;
+    if (!fake) {
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *filePath = [docs stringByAppendingPathComponent:ns_encrypt("spoof.txt")];
+        
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:filePath]) {
+            NSString *uuidString = [NSString stringWithContentsOfFile:filePath encoding:NSUTF8StringEncoding error:nil];
+            if (uuidString.length > 0) {
+                fake = [[NSUUID alloc] initWithUUIDString:uuidString];
+            }
+        }
+        
+        if (!fake) {
+            fake = [[NSUUID alloc] initWithUUIDString:random_uuid()];
+            [fake.UUIDString writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    }
+    return fake;
+}
+%end
+
+static int (*orig_sysctlbyname)(const char *name, void *oldp, size_t *oldlenp,
+                                void *newp, size_t newlen);
+
+static NSString *spoofedMachine = nil;
+
+static NSString *getSpoofedMachine() {
+    if (spoofedMachine) return spoofedMachine;
+    
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *filePath = [docs stringByAppendingPathComponent:ns_encrypt("model.txt")];
+
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:filePath];
+    if (!dict) dict = [NSMutableDictionary dictionary];
+
+    NSString *saved = dict[ns_encrypt("hw.machine")];
+    if (saved && saved.length > 0) {
+        spoofedMachine = saved;
+    } else {
+        int major = arc4random_uniform(10) + 1;
+        int minor = arc4random_uniform(10);
+        spoofedMachine = [NSString stringWithFormat:@"iPhone%d,%d", major, minor];
+        //spoofedMachine = ns_encrypt("samsung5,0");
+        dict[ns_encrypt("hw.machine")] = spoofedMachine;
+        [dict writeToFile:filePath atomically:YES];
+    }
+    return spoofedMachine;
+}
+
+int hk_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                    void *newp, size_t newlen) {
+    if (strcmp(name, ay_obfuscate("hw.machine")) == 0 && oldp && oldlenp) {
+        NSString *val = getSpoofedMachine();
+        const char *spoof = [val UTF8String];
+        size_t len = strlen(spoof);
+
+        if (*oldlenp >= len + 1) {
+            strcpy((char *)oldp, spoof);
+            *oldlenp = len;
+            return 0;
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+
+static int (*orig_uname)(struct utsname *buf);
+int hk_uname(struct utsname *buf) {
+    int ret = orig_uname(buf);
+    if (ret == 0 && buf) {
+        int major = arc4random_uniform(10) + 1;
+        int minor = arc4random_uniform(10);
+
+        std::string machine = crypt_string("iPhone") + std::to_string(major) + crypt_string(",") + std::to_string(minor);
+
+        strcpy(buf->machine, machine.c_str());
+    }
+    return ret;
+}
+
+__attribute__((constructor))
+static void init_dyld_hooks() {
+   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        utsname systemInfo;
+        uname( &systemInfo );
+        g_ctx->backup_model = systemInfo.machine;
+        NSUUID* identifierForVendor = [[UIDevice currentDevice] identifierForVendor];
+        g_ctx->backup_hardware = [[identifierForVendor UUIDString] UTF8String];
+        aggregate_dyld();
+        %init(dyld_hooks);
+        %init(_ungrouped);
+        struct rebinding rebs[] = {
+            { ("dlsym"), (void *)hk_dlsym, (void **)&og_dlsym },
+            { ("task_info"), (void*)hk_task_info, (void**)&og_task_info },
+            { ("sysctlbyname"), (void *)hk_sysctlbyname, (void **)&orig_sysctlbyname },
+            { ("uname"), (void *)hk_uname, (void **)&orig_uname },
+            //{ "exit", (void*)hk_exit, (void**)&orig_exit },
+            //{ "abort", (void*)hk_abort, (void**)&orig_abort },
+            //{ "_dyld_image_count", (void*)my__dyld_image_count, (void**)&orig__dyld_image_count },
+            //{ "_dyld_get_image_name", (void*)my__dyld_get_image_name, (void**)&orig__dyld_get_image_name },
+            //{ "_dyld_get_image_header", (void*)my__dyld_get_image_header, (void**)&orig__dyld_get_image_header },
+            //{ "_dyld_get_image_vmaddr_slide", (void*)my__dyld_get_image_vmaddr_slide, (void**)&orig__dyld_get_image_vmaddr_slide }
+        };
+        rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
+    });
+}
